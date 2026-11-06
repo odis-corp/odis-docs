@@ -1,0 +1,1353 @@
+openapi: 3.1.0
+info:
+  title: Cloud Storage API
+  version: 1.0.0
+  description: |
+    HTTP-контракт облачного хранилища. Все операции, кроме `/public/*` и `/healthz`,
+    требуют аутентификации. Проверка прав выполняется на сервере для каждой операции;
+    клиент не является источником истины в вопросах доступа.
+
+    Единый формат ошибок описан в `components/schemas/Error`.
+    Идемпотентность: `PUT`, `DELETE` идемпотентны; `POST` — нет, кроме явно помеченных.
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: auth
+  - name: nodes
+  - name: uploads
+  - name: versions
+  - name: trash
+  - name: shares
+  - name: links
+  - name: search
+  - name: comments
+  - name: sync
+  - name: admin
+  - name: export
+
+paths:
+  /healthz:
+    get:
+      tags: [admin]
+      security: []
+      summary: Проверка работоспособности
+      responses:
+        '200':
+          description: Сервис работает
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [ok] }
+                  db: { type: string, enum: [ok, degraded] }
+  /auth/login:
+    post:
+      tags: [auth]
+      security: []
+      summary: Вход по паролю
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, minLength: 1 }
+                totp: { type: string, pattern: '^[0-9]{6}$' }
+      responses:
+        '200':
+          description: Успешный вход; сессионная cookie установлена
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Требуется второй фактор либо учётная запись заблокирована
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: Выход и завершение сессии
+      responses:
+        '204': { description: Сессия завершена }
+  /me:
+    get:
+      tags: [auth]
+      summary: Текущий пользователь и использование квоты
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /nodes:
+    get:
+      tags: [nodes]
+      summary: Список содержимого папки
+      parameters:
+        - name: parent_id
+          in: query
+          schema: { type: string, format: uuid }
+          description: Отсутствует — корень учётной записи
+        - name: include_trashed
+          in: query
+          schema: { type: boolean, default: false }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Элементы папки. Порядок стабилен и не зависит от времени изменения.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+                  next_cursor: { type: [string, 'null'] }
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [nodes]
+      summary: Создать папку
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [parent_id, name]
+              properties:
+                parent_id: { type: string, format: uuid }
+                name: { type: string, minLength: 1, maxLength: 255 }
+      responses:
+        '201':
+          description: Папка создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '409':
+          $ref: '#/components/responses/NameConflict'
+        '422':
+          $ref: '#/components/responses/InvalidName'
+
+  /nodes/{nodeId}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      summary: Метаданные объекта
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [nodes]
+      summary: Переименовать или переместить
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 1, maxLength: 255 }
+                parent_id: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Обновлённый объект
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '409':
+          $ref: '#/components/responses/NameConflict'
+        '422':
+          $ref: '#/components/responses/InvalidName'
+    delete:
+      tags: [nodes]
+      summary: Переместить в корзину
+      parameters:
+        - name: purge
+          in: query
+          schema: { type: boolean, default: false }
+          description: Немедленное окончательное удаление (требует подтверждения `confirm=true`)
+        - name: confirm
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '204': { description: Объект перемещён в корзину либо удалён окончательно }
+        '409':
+          description: Окончательное удаление без подтверждения
+  /nodes/{nodeId}/resolve:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [sync]
+      summary: Разрешить конфликт, выбрав основную версию
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keep]
+              properties:
+                keep:
+                  type: string
+                  enum: [current, conflict]
+                  description: |
+                    `current` — оставить версию сервера, конфликтную копию переместить в корзину;
+                    `conflict` — сделать версию устройства текущей, серверную сохранить как обычный файл.
+                delete_loser:
+                  type: boolean
+                  default: false
+                  description: Переместить проигравшую версию в корзину вместо сохранения
+      responses:
+        '200':
+          description: Конфликт снят; обе версии учтены
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '409':
+          description: Узел не находится в состоянии конфликта
+
+  /nodes/{nodeId}/tags:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [search]
+      summary: Метки объекта
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Tag' }
+    post:
+      tags: [search]
+      summary: Назначить метку
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 64 }
+                color: { type: string }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Tag' }
+  /nodes/{nodeId}/tags/{tagId}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+      - name: tagId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [search]
+      summary: Снять метку
+      responses:
+        '204': { description: Метка снята }
+
+  /nodes/{nodeId}/properties:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [search]
+      summary: Пользовательские свойства объекта
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Property' }
+    post:
+      tags: [search]
+      summary: Задать свойство
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, value]
+              properties:
+                key: { type: string, minLength: 1, maxLength: 64 }
+                value: { type: string, maxLength: 4096 }
+                value_type: { type: string, enum: [text, number, date, bool], default: text }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Property' }
+  /nodes/{nodeId}/properties/{key}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+      - name: key
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [search]
+      summary: Удалить свойство
+      responses:
+        '204': { description: Свойство удалено }
+
+  /nodes/{nodeId}/e2ee:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      summary: Включить сквозное шифрование для папки
+      description: |
+        Необратимая операция. До включения клиент обязан показать перечень
+        недоступных возможностей (FR-090). Сервер не получает ключей.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key_wrapped, kdf_params, recovery_mode]
+              properties:
+                key_wrapped: { type: string, contentEncoding: base64 }
+                kdf_params: { type: object, additionalProperties: true }
+                recovery_mode: { type: string, enum: [none, mnemonic] }
+      responses:
+        '201':
+          description: Шифрование включено; папка исключена из индексации содержимого
+        '409':
+          description: Папка уже зашифрована либо содержит незашифрованные дочерние объекты
+
+  /nodes/{nodeId}/copy:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      summary: Скопировать объект в другую папку
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [parent_id]
+              properties:
+                parent_id: { type: string, format: uuid }
+                name: { type: string }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+        '409':
+          $ref: '#/components/responses/NameConflict'
+  /nodes/{nodeId}/content:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      summary: Скачать содержимое (поддерживает Range)
+      parameters:
+        - name: version_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: Range
+          in: header
+          schema: { type: string }
+      responses:
+        '200':
+          description: Полное содержимое
+          headers:
+            ETag: { schema: { type: string } }
+            Content-Length: { schema: { type: integer } }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '206':
+          description: Частичное содержимое
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /uploads:
+    post:
+      tags: [uploads]
+      summary: Создать сессию загрузки
+      description: |
+        Создаёт сессию с поддержкой докачки. Файл не появляется в листингах,
+        пока сессия не завершена и содержимое не зафиксировано.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [parent_id, name, size]
+              properties:
+                parent_id: { type: string, format: uuid }
+                name: { type: string, minLength: 1, maxLength: 255 }
+                size: { type: integer, minimum: 0 }
+                mime_type: { type: string }
+                sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+                node_id:
+                  type: string
+                  format: uuid
+                  description: |
+                    Если задан — загрузка заменяет содержимое существующего узла,
+                    создавая новую версию; предыдущая версия сохраняется (FR-027).
+                    `name` и `parent_id` в этом случае игнорируются.
+                conflict_policy:
+                  type: string
+                  enum: [fail, overwrite, keep_both]
+                  default: fail
+      responses:
+        '201':
+          description: Сессия создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UploadSession' }
+        '409':
+          $ref: '#/components/responses/NameConflict'
+        '413':
+          description: Превышена квота; в теле — остаток и рекомендация освободить место
+  /uploads/{uploadId}:
+    parameters:
+      - name: uploadId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    head:
+      tags: [uploads]
+      summary: Текущее смещение
+      responses:
+        '200':
+          description: Смещение в заголовке `Upload-Offset`
+          headers:
+            Upload-Offset: { schema: { type: integer } }
+            Upload-Length: { schema: { type: integer } }
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [uploads]
+      summary: Передать очередной фрагмент
+      parameters:
+        - name: Upload-Offset
+          in: header
+          required: true
+          schema: { type: integer, minimum: 0 }
+        - name: Content-Type
+          in: header
+          schema: { type: string, enum: [application/offset+octet-stream] }
+      requestBody:
+        required: true
+        content:
+          application/offset+octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '204':
+          description: Фрагмент принят
+          headers:
+            Upload-Offset: { schema: { type: integer } }
+        '409':
+          description: Смещение не совпадает; клиент должен запросить `HEAD`
+        '422':
+          description: Хеш не совпал после завершения
+    delete:
+      tags: [uploads]
+      summary: Прервать сессию
+      responses:
+        '204': { description: Сессия прервана, временные данные удалены }
+
+  /nodes/{nodeId}/versions:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [versions]
+      summary: История версий
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Version' }
+                  retention:
+                    $ref: '#/components/schemas/Retention'
+  /nodes/{nodeId}/versions/{versionId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+      - name: versionId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [versions]
+      summary: Сделать версию текущей
+      description: Создаёт новую версию; остальные версии не удаляются.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+
+  /trash:
+    get:
+      tags: [trash]
+      summary: Содержимое корзины
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+                  retention:
+                    $ref: '#/components/schemas/Retention'
+    delete:
+      tags: [trash]
+      summary: Очистить корзину
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          schema: { type: boolean, enum: [true] }
+      responses:
+        '204': { description: Корзина очищена безвозвратно }
+  /nodes/{nodeId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [trash]
+      summary: Восстановить из корзины
+      description: Если исходное место занято — создаётся копия с отличающимся именем.
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Node' }
+
+  /nodes/{nodeId}/shares:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [shares]
+      summary: Кому выдан доступ
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Share' }
+    post:
+      tags: [shares]
+      summary: Выдать доступ
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [level]
+              properties:
+                grantee_user_id: { type: string, format: uuid }
+                grantee_group_id: { type: string, format: uuid }
+                level: { type: string, enum: [view, comment, edit, own] }
+                expires_at: { type: string, format: date-time }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Share' }
+        '400':
+          description: Указаны оба получателя или ни одного
+  /shares/{shareId}:
+    delete:
+      tags: [shares]
+      summary: Отозвать доступ
+      parameters:
+        - name: shareId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Доступ отозван }
+
+  /nodes/{nodeId}/links:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [links]
+      summary: Активные ссылки объекта
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Link' }
+    post:
+      tags: [links]
+      summary: Создать публичную ссылку
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [view, upload] }
+                password: { type: string, minLength: 4 }
+                expires_at: { type: string, format: date-time }
+                max_downloads: { type: integer, minimum: 1 }
+      responses:
+        '201':
+          description: Ссылка создана; полный URL возвращается один раз
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  link: { $ref: '#/components/schemas/Link' }
+                  url: { type: string, format: uri }
+  /links/{linkId}/revoke:
+    post:
+      tags: [links]
+      summary: Отозвать ссылку
+      parameters:
+        - name: linkId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Ссылка отозвана; дальнейший доступ невозможен }
+
+  /public/{token}:
+    get:
+      tags: [links]
+      security: []
+      summary: Открыть публичную ссылку
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+        - name: password
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: |
+            Для `kind=view` — метаданные и возможность скачивания.
+            Для защищённой ссылки без пароля возвращается `401` с признаком `password_required`.
+            Сведения о других объектах хранилища не раскрываются.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node: { $ref: '#/components/schemas/Node' }
+                  children:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+        '401':
+          description: Требуется пароль
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: Срок действия истёк или ссылка отозвана
+  /public/upload/{token}:
+    post:
+      tags: [links]
+      security: []
+      summary: Загрузить файл по ссылке на загрузку
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Файл принят; содержимое папки не раскрывается
+        '403':
+          description: Ссылка не является ссылкой на загрузку
+
+  /search:
+    get:
+      tags: [search]
+      summary: Поиск по доступным объектам
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Подстрока имени (триграммы)
+        - name: content
+          in: query
+          schema: { type: string }
+          description: Полнотекстовый поиск; для зашифрованных папок не применяется
+        - name: kind
+          in: query
+          schema: { type: string, enum: [file, folder] }
+        - name: mime
+          in: query
+          schema: { type: string }
+        - name: owner_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: tag
+          in: query
+          schema: { type: string }
+        - name: modified_after
+          in: query
+          schema: { type: string, format: date-time }
+        - name: modified_before
+          in: query
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+      responses:
+        '200':
+          description: Только объекты, доступные текущему пользователю
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+                  total: { type: integer }
+
+  /nodes/{nodeId}/comments:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [comments]
+      summary: Комментарии к объекту
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Comment' }
+    post:
+      tags: [comments]
+      summary: Оставить комментарий
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, minLength: 1, maxLength: 10000 }
+                parent_id: { type: string, format: uuid }
+                mentions:
+                  type: array
+                  items: { type: string, format: uuid }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Comment' }
+
+  /devices:
+    get:
+      tags: [sync]
+      summary: Подключённые устройства
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Device' }
+    post:
+      tags: [sync]
+      summary: Зарегистрировать устройство
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, platform]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100 }
+                platform: { type: string, enum: [windows, macos, linux, android, ios, web, other] }
+      responses:
+        '201':
+          description: Токен устройства возвращается один раз
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device: { $ref: '#/components/schemas/Device' }
+                  device_token: { type: string }
+  /devices/{deviceId}:
+    delete:
+      tags: [sync]
+      summary: Отозвать устройство
+      parameters:
+        - name: deviceId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Устройство отозвано; синхронизация прекращена }
+
+  /sync/tree:
+    get:
+      tags: [sync]
+      summary: Полный снимок дерева для полной сверки
+      description: |
+        Используется, когда курсор устройства старше горизонта ретенции
+        (`resync_required: true`). Возвращает постранично все доступные узлы
+        с текущими версиями.
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Node' }
+                  next_cursor: { type: [string, 'null'] }
+                  latest_seq: { type: integer }
+
+  /sync/changes:
+    get:
+      tags: [sync]
+      summary: Изменения после курсора
+      description: |
+        Порядок определяется монотонным `seq`, а не временем. Устройство обязано
+        применять изменения в порядке возрастания `seq`.
+      parameters:
+        - name: since
+          in: query
+          required: true
+          schema: { type: integer, minimum: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 500 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  changes:
+                    type: array
+                    items: { $ref: '#/components/schemas/SyncChange' }
+                  latest_seq: { type: integer }
+                  resync_required:
+                    type: boolean
+                    description: Курсор старше горизонта ретенции — требуется полная сверка
+        '409':
+          description: Курсор в будущем относительно сервера
+  /sync/push:
+    post:
+      tags: [sync]
+      summary: Отправить локальные изменения
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_id, operations]
+              properties:
+                device_id: { type: string, format: uuid }
+                operations:
+                  type: array
+                  items: { $ref: '#/components/schemas/SyncOperation' }
+      responses:
+        '200':
+          description: Результат по каждой операции; конфликты помечены, обе версии сохранены
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        client_op_id: { type: string }
+                        status: { type: string, enum: [applied, conflict, rejected] }
+                        node: { $ref: '#/components/schemas/Node' }
+                        conflict_node: { $ref: '#/components/schemas/Node' }
+                        reason: { type: string }
+
+  /notifications:
+    get:
+      tags: [auth]
+      summary: Уведомления
+      parameters:
+        - name: unread_only
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Notification' }
+                  unread: { type: integer }
+  /notifications/read:
+    post:
+      tags: [auth]
+      summary: Отметить уведомления прочитанными
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                ids:
+                  type: array
+                  items: { type: string, format: uuid }
+                all: { type: boolean }
+      responses:
+        '204': { description: Отмечено }
+
+  /export:
+    post:
+      tags: [export]
+      summary: Запросить полную выгрузку учётной записи
+      responses:
+        '202':
+          description: Задача создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+  /export/{jobId}:
+    get:
+      tags: [export]
+      summary: Состояние выгрузки
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+
+  /admin/users:
+    get:
+      tags: [admin]
+      summary: Список пользователей
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/User' }
+    post:
+      tags: [admin]
+      summary: Создать пользователя
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, display_name]
+              properties:
+                email: { type: string, format: email }
+                display_name: { type: string }
+                role: { type: string, enum: [member, admin] }
+                quota_bytes: { type: integer }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+  /admin/users/{userId}:
+    patch:
+      tags: [admin]
+      summary: Изменить пользователя (блокировка, квота, роль)
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status: { type: string, enum: [active, blocked] }
+                role: { type: string, enum: [member, admin] }
+                quota_bytes: { type: integer }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+  /admin/users/{userId}/transfer:
+    post:
+      tags: [admin]
+      summary: Передать владение данными заблокированного пользователя
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_user_id]
+              properties:
+                to_user_id: { type: string, format: uuid }
+      responses:
+        '202':
+          description: Задача передачи создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Job' }
+  /admin/audit:
+    get:
+      tags: [admin]
+      summary: Журнал действий
+      parameters:
+        - name: actor_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: action
+          in: query
+          schema: { type: string }
+        - name: since
+          in: query
+          schema: { type: string, format: date-time }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEvent' }
+  /admin/backup/status:
+    get:
+      tags: [admin]
+      summary: Состояние резервного копирования и последней проверки
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  last_backup_at: { type: [string, 'null'], format: date-time }
+                  last_verified_at: { type: [string, 'null'], format: date-time }
+                  last_result: { type: string, enum: [ok, failed, never] }
+                  message: { type: [string, 'null'] }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: session
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Токен устройства
+  parameters:
+    NodeId:
+      name: nodeId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Unauthorized:
+      description: Аутентификация не пройдена
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Действие запрещено правами (существование объекта не подтверждается)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Объект не найден или недоступен
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NameConflict:
+      description: Имя уже занято в этой папке (с учётом регистра)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InvalidName:
+      description: Имя недопустимо на целевых платформах
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, examples: [forbidden, not_found, name_conflict, invalid_name, quota_exceeded] }
+        message: { type: string }
+        details:
+          type: object
+          additionalProperties: true
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        role: { type: string, enum: [member, admin] }
+        status: { type: string, enum: [active, blocked, deleted] }
+        quota:
+          type: object
+          properties:
+            limit_bytes: { type: [integer, 'null'] }
+            used_bytes: { type: integer }
+            versions_bytes: { type: integer }
+            trash_bytes: { type: integer }
+        mfa_enabled: { type: boolean }
+    Node:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        parent_id: { type: [string, 'null'], format: uuid }
+        kind: { type: string, enum: [folder, file] }
+        name: { type: string }
+        size_bytes: { type: integer }
+        mime_type: { type: [string, 'null'] }
+        state: { type: string, enum: [active, conflict, trashed, pending] }
+        owner_id: { type: string, format: uuid }
+        current_version_id: { type: [string, 'null'], format: uuid }
+        encrypted: { type: boolean }
+        conflict_of: { type: [string, 'null'], format: uuid }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        permissions:
+          type: object
+          properties:
+            can_view: { type: boolean }
+            can_comment: { type: boolean }
+            can_edit: { type: boolean }
+            can_share: { type: boolean }
+            can_delete: { type: boolean }
+    UploadSession:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        upload_url: { type: string }
+        offset: { type: integer }
+        expires_at: { type: string, format: date-time }
+    Version:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        seq: { type: integer }
+        size_bytes: { type: integer }
+        created_by: { type: [string, 'null'], format: uuid }
+        created_at: { type: string, format: date-time }
+        origin: { type: string, enum: [upload, sync, restore, collab, external] }
+    Retention:
+      type: object
+      properties:
+        versions_days: { type: integer }
+        versions_max_count: { type: integer }
+        trash_days: { type: integer }
+    Share:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        grantee_user_id: { type: [string, 'null'], format: uuid }
+        grantee_group_id: { type: [string, 'null'], format: uuid }
+        level: { type: string, enum: [view, comment, edit, own] }
+        expires_at: { type: [string, 'null'], format: date-time }
+    Link:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        kind: { type: string, enum: [view, upload] }
+        expires_at: { type: [string, 'null'], format: date-time }
+        max_downloads: { type: [integer, 'null'] }
+        download_count: { type: integer }
+        state: { type: string, enum: [active, expired, revoked, orphaned] }
+    Comment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        node_id: { type: string, format: uuid }
+        parent_id: { type: [string, 'null'], format: uuid }
+        author_id: { type: string, format: uuid }
+        body: { type: string }
+        created_at: { type: string, format: date-time }
+    Notification:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        payload: { type: object, additionalProperties: true }
+        read_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+    Device:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        platform: { type: string, enum: [windows, macos, linux, android, ios, web, other] }
+        last_seen_at: { type: [string, 'null'], format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time }
+    Tag:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        color: { type: [string, 'null'] }
+    Property:
+      type: object
+      properties:
+        key: { type: string }
+        value: { type: string }
+        value_type: { type: string, enum: [text, number, date, bool] }
+    SyncChange:
+      type: object
+      properties:
+        seq: { type: integer }
+        node_id: { type: string, format: uuid }
+        op: { type: string, enum: [upsert, delete, rename, move, restore, conflict] }
+        version_id: { type: [string, 'null'], format: uuid }
+        payload: { type: object, additionalProperties: true }
+    SyncOperation:
+      type: object
+      required: [client_op_id, op, node_id]
+      properties:
+        client_op_id: { type: string }
+        op: { type: string, enum: [upsert, delete, rename, move, restore] }
+        node_id: { type: string, format: uuid }
+        base_version_id: { type: [string, 'null'], format: uuid }
+        name: { type: string }
+        parent_id: { type: string, format: uuid }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+        size: { type: integer }
+        mtime: { type: string, format: date-time }
+    Job:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        kind: { type: string }
+        state: { type: string, enum: [queued, running, done, failed] }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        download_url: { type: [string, 'null'], format: uri }
+        message: { type: [string, 'null'] }
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: integer }
+        actor_id: { type: [string, 'null'], format: uuid }
+        action: { type: string }
+        target_type: { type: string }
+        target_id: { type: [string, 'null'], format: uuid }
+        result: { type: string, enum: [ok, denied, error] }
+        created_at: { type: string, format: date-time }
+security:
+  - cookieAuth: []
+  - bearerAuth: []
